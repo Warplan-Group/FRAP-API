@@ -1,3 +1,10 @@
+// Load environment variables from .env file if it exists (for local development)
+try {
+  require('dotenv').config();
+} catch (e) {
+  // dotenv not installed, continue without it
+}
+
 const express = require('express');
 const axios = require('axios');
 
@@ -65,7 +72,7 @@ async function createZoomTicket({ email, firstName, lastName, eventId }) {
   const ticketTypeId = await getZoomTicketTypeId(accessToken, eventId);
 
   const resp = await axios.post(
-    `https://api.zoom.us/v2/zoom_events/events/${eventId}/ticket_types`,
+    `https://api.zoom.us/v2/zoom_events/events/${eventId}/tickets`,
     {
       tickets: [
         {
