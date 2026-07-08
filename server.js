@@ -7,6 +7,7 @@ try {
 
 const express = require('express');
 const axios = require('axios');
+const crypto = require('crypto');
 
 const app = express();
 const port = process.env.PORT || 8080;
@@ -16,6 +17,7 @@ const zoomAccountId = process.env.ZOOM_ACCOUNT_ID;
 const zoomClientId = process.env.ZOOM_CLIENT_ID;
 const zoomClientSecret = process.env.ZOOM_CLIENT_SECRET;
 const webhookSecret = process.env.WEBHOOK_SECRET;
+const zoomWebhookSecret = process.env.ZOOM_WEBHOOK_SECRET;
 const ghlWebhookUrl = process.env.GHL_WEBHOOK_URL || 'https://services.leadconnectorhq.com/hooks/IIj2wLTtKXJclBizkv0C/webhook-trigger/60bd96c1-ce08-4bf9-995a-6df73fba52d2';
 
 // ===== MIDDLEWARE =====
@@ -300,6 +302,76 @@ async function getZoomEventAttendance(eventId) {
   }
 }
 
+function isZoomWebhookPayload(body) {
+  return Boolean(body && typeof body.event === 'string');
+}
+
+function extractZoomEventId(body) {
+  return (
+    body?.event_id ||
+    body?.eventId ||
+    body?.event?.id ||
+    body?.payload?.object?.event_id ||
+    body?.payload?.event_id ||
+    null
+  );
+}
+
+function handleZoomUrlValidation(req, res) {
+  const plainToken = req.body?.payload?.plainToken;
+
+  if (!plainToken) {
+    return res.status(400).json({ error: 'Missing plainToken' });
+  }
+
+  if (!zoomWebhookSecret) {
+    return res.status(500).json({ error: 'ZOOM_WEBHOOK_SECRET not configured' });
+  }
+
+  const encryptedToken = crypto
+    .createHmac('sha256', zoomWebhookSecret)
+    .update(plainToken)
+    .digest('hex');
+
+  return res.status(200).json({ plainToken, encryptedToken });
+}
+
+async function processEventEndReport(eventId) {
+  console.log(`Processing person summary report for event: ${eventId}`);
+
+  const people = await getZoomEventAttendance(eventId);
+
+  if (!people || people.length === 0) {
+    console.log(`No people found for event ${eventId}`);
+    return { eventId, processed: 0 };
+  }
+
+  const peopleWithEmail = people.filter((person) => person.email);
+  if (peopleWithEmail.length === 0) {
+    console.log(`No people with email found for event ${eventId}`);
+    return { eventId, processed: 0 };
+  }
+
+  const webinarDate = peopleWithEmail[0]?.webinarDate || '';
+  console.log(
+    `Sending 1 GHL batch for event ${eventId}: ${peopleWithEmail.length} people`
+  );
+
+  await sendAttendanceBatchToGHL({
+    eventId,
+    webinarDate,
+    people: peopleWithEmail
+  });
+
+  return {
+    eventId,
+    mode: 'batch',
+    processed: peopleWithEmail.length,
+    attended: peopleWithEmail.filter((p) => p.attended).length,
+    absent: peopleWithEmail.filter((p) => !p.attended).length
+  };
+}
+
 // One GHL webhook for the whole event (batch). GHL Custom Code loops people[].
 async function sendAttendanceBatchToGHL({ eventId, webinarDate, people }) {
   const payload = {
@@ -384,65 +456,40 @@ app.post('/webhooks/ghl-to-zoom', async (req, res) => {
 // Zoom webhook endpoint - handles event end and sends attendance to GHL
 app.post('/webhooks/zoom-event-end', async (req, res) => {
   try {
-    // Verify webhook secret if provided
-    const providedSecret = req.headers['x-webhook-secret'] || req.query.secret;
-    if (webhookSecret && providedSecret !== webhookSecret) {
-      return res.status(401).json({ error: 'Unauthorized' });
+    if (req.body?.event === 'endpoint.url_validation') {
+      return handleZoomUrlValidation(req, res);
     }
 
-    // Extract event ID from Zoom webhook payload
-    const { event_id, event } = req.body;
-    const eventId = event_id || event?.id || req.body.eventId;
+    const isZoom = isZoomWebhookPayload(req.body);
+
+    if (!isZoom) {
+      const providedSecret = req.headers['x-webhook-secret'] || req.query.secret;
+      if (webhookSecret && providedSecret !== webhookSecret) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+    }
+
+    const eventId = extractZoomEventId(req.body);
 
     if (!eventId) {
       return res.status(400).json({ error: 'Missing eventId in webhook payload' });
     }
 
-    console.log(`Processing person summary report for event: ${eventId}`);
-
-    // Get People Tab style attendance from Zoom
-    const people = await getZoomEventAttendance(eventId);
-
-    if (!people || people.length === 0) {
-      return res.status(200).json({
-        status: 'success',
-        message: 'No people found in Zoom attendance report',
-        eventId,
-        processed: 0
+    if (isZoom) {
+      res.status(200).json({ status: 'accepted', eventId });
+      processEventEndReport(eventId).catch((err) => {
+        console.error(`Background report failed for ${eventId}:`, err);
       });
+      return;
     }
 
-    const peopleWithEmail = people.filter((person) => person.email);
-    if (peopleWithEmail.length === 0) {
-      return res.status(200).json({
-        status: 'success',
-        message: 'No people with email found in Zoom attendance report',
-        eventId,
-        processed: 0
-      });
-    }
-
-    const webinarDate = peopleWithEmail[0]?.webinarDate || '';
-    console.log(
-      `Sending 1 GHL batch for event ${eventId}: ${peopleWithEmail.length} people`
-    );
-
-    await sendAttendanceBatchToGHL({
-      eventId,
-      webinarDate,
-      people: peopleWithEmail
-    });
+    const result = await processEventEndReport(eventId);
 
     return res.status(200).json({
       status: 'success',
-      eventId,
-      mode: 'batch',
-      processed: peopleWithEmail.length,
-      attended: peopleWithEmail.filter((p) => p.attended).length,
-      absent: peopleWithEmail.filter((p) => !p.attended).length,
+      ...result,
       ghl: 'single webhook push'
     });
-
   } catch (err) {
     console.error('Zoom webhook error:', err);
     return res.status(500).json({

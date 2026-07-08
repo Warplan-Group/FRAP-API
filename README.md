@@ -104,12 +104,20 @@ Invoke-RestMethod -Uri "https://frap-api-145186078912.us-south1.run.app/webhooks
 - `ZOOM_ACCOUNT_ID` - Zoom account ID
 - `ZOOM_CLIENT_ID` - Zoom OAuth client ID
 - `ZOOM_CLIENT_SECRET` - Zoom OAuth client secret
-- `WEBHOOK_SECRET` - Secret for webhook authentication
-- `GHL_WEBHOOK_URL` - GHL webhook URL (optional, has default)
+- `WEBHOOK_SECRET` - Secret for manual webhook authentication (`x-webhook-secret`)
+- `ZOOM_WEBHOOK_SECRET` - Zoom Event Subscription **Secret Token** (required for Marketplace URL validation)
+- `GHL_WEBHOOK_URL` - GHL inbound webhook URL (optional, has default)
 
 ## Post-Zoom Report → GHL
 
-`POST /webhooks/zoom-event-end` sends **one JSON batch** to GHL:
+`POST /webhooks/zoom-event-end` handles:
+
+1. **Zoom URL validation** — responds to `endpoint.url_validation` with HMAC SHA-256 of `plainToken` using `ZOOM_WEBHOOK_SECRET`
+2. **Session ended** — accepts Zoom `session_ended` payloads, returns `200` immediately, then pulls attendance and sends **one JSON batch** to GHL
+
+Manual tests still work with `x-webhook-secret` and `{ "event_id": "..." }`.
+
+Sends **one JSON batch** to GHL:
 
 ```json
 {
