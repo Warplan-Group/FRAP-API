@@ -16,9 +16,11 @@ const zoomAccountId = process.env.ZOOM_ACCOUNT_ID;
 const zoomClientId = process.env.ZOOM_CLIENT_ID;
 const zoomClientSecret = process.env.ZOOM_CLIENT_SECRET;
 const webhookSecret = process.env.WEBHOOK_SECRET;
+const ghlWebhookUrl = process.env.GHL_WEBHOOK_URL || 'https://services.leadconnectorhq.com/hooks/IIj2wLTtKXJclBizkv0C/webhook-trigger/60bd96c1-ce08-4bf9-995a-6df73fba52d2';
 
 // ===== MIDDLEWARE =====
 app.use(express.json());
+app.use(express.urlencoded({ extended: true })); // For URL-encoded data
 
 // ===== ZOOM HELPERS =====
 
@@ -107,6 +109,225 @@ function extractJoinLink(zoomData) {
   );
 }
 
+// Pull webinar/event date from Zoom event details
+function extractWebinarDate(eventData) {
+  const candidates = [
+    eventData?.start_time,
+    eventData?.calendar?.[0]?.start_time,
+    eventData?.calendar?.[0]?.start,
+    eventData?.sessions?.[0]?.start_time,
+    eventData?.sessions?.[0]?.start
+  ];
+
+  for (const value of candidates) {
+    if (!value) continue;
+    const date = new Date(value);
+    if (!Number.isNaN(date.getTime())) {
+      return date.toISOString().slice(0, 10);
+    }
+  }
+
+  return '';
+}
+
+function sumTimeSpentMinutes(sessionAttendance = []) {
+  return sessionAttendance.reduce((total, session) => {
+    const minutes = Number(session?.duration_spent_in_session);
+    return total + (Number.isFinite(minutes) ? minutes : 0);
+  }, 0);
+}
+
+function didAttend(person) {
+  const eventStatus = String(person?.event_attendance || '').toLowerCase();
+  if (eventStatus === 'attended' || eventStatus === 'yes') return true;
+  if (eventStatus === 'absent' || eventStatus === 'no') return false;
+
+  const sessions = person?.session_attendance || [];
+  return sessions.some((session) => {
+    const status = String(session?.session_attendance || '').toLowerCase();
+    return status === 'attended' || status === 'yes';
+  });
+}
+
+// People-tab style report: attended yes/no, time spent, optional engagement
+function mapPersonSummary(person, webinarDate) {
+  const timeSpentMinutes = sumTimeSpentMinutes(person?.session_attendance);
+  const engagementScore =
+    person?.engagement_score ??
+    person?.engagementScore ??
+    '';
+
+  return {
+    email: person?.email || '',
+    firstName: person?.first_name || '',
+    lastName: person?.last_name || '',
+    webinarDate,
+    attended: didAttend(person),
+    timeSpentMinutes,
+    engagementScore: engagementScore === null || engagementScore === undefined
+      ? ''
+      : String(engagementScore)
+  };
+}
+
+async function fetchPaginatedAttendees(url, accessToken, label) {
+  const attendees = [];
+  let nextPageToken = null;
+  let pageCount = 0;
+
+  do {
+    const params = { page_size: 300 };
+    if (nextPageToken) params.next_page_token = nextPageToken;
+
+    const resp = await axios.get(url, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      params
+    });
+
+    const page = resp.data?.attendees || [];
+    attendees.push(...page);
+    nextPageToken = resp.data?.next_page_token || null;
+    pageCount += 1;
+    console.log(`${label} page ${pageCount}: ${page.length} people (total ${attendees.length})`);
+  } while (nextPageToken);
+
+  return attendees;
+}
+
+// Get Zoom Person Summary style attendance for an event
+async function getZoomEventAttendance(eventId) {
+  const accessToken = await getZoomAccessToken();
+
+  try {
+    const eventResp = await axios.get(
+      `https://api.zoom.us/v2/zoom_events/events/${eventId}`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+
+    const eventData = eventResp.data;
+    const webinarDate = extractWebinarDate(eventData);
+    const sessions = eventData?.sessions || [];
+
+    console.log(
+      `Event ${eventId}: type=${eventData?.event_type}, sessions=${sessions.length}, webinarDate=${webinarDate || 'unknown'}`
+    );
+
+    // Primary source: Zoom Events People/attendance report (closest to Person Summary CSV)
+    try {
+      const reportPeople = await fetchPaginatedAttendees(
+        `https://api.zoom.us/v2/zoom_events/events/${eventId}/reports/event_attendance`,
+        accessToken,
+        'event_attendance'
+      );
+
+      if (reportPeople.length > 0) {
+        const mapped = reportPeople
+          .map((person) => mapPersonSummary(person, webinarDate))
+          .filter((person) => person.email);
+
+        console.log(`Mapped ${mapped.length} people from event_attendance report`);
+        console.log('Sample person summary:', JSON.stringify(mapped[0], null, 2));
+        return mapped;
+      }
+
+      console.log('event_attendance returned 0 people — trying session attendance reports');
+    } catch (reportErr) {
+      console.error(
+        'event_attendance report failed:',
+        reportErr.response?.data || reportErr.message
+      );
+    }
+
+    // Fallback: per-session attendance reports aggregated by email
+    if (sessions.length > 0) {
+      const byEmail = new Map();
+
+      for (const session of sessions) {
+        const sessionId = session.id || session.session_id;
+        if (!sessionId) continue;
+
+        try {
+          const sessionPeople = await fetchPaginatedAttendees(
+            `https://api.zoom.us/v2/zoom_events/events/${eventId}/reports/sessions/${sessionId}/attendance`,
+            accessToken,
+            `session ${sessionId}`
+          );
+
+          for (const person of sessionPeople) {
+            const email = person?.email;
+            if (!email) continue;
+
+            const existing = byEmail.get(email) || {
+              email,
+              first_name: person.first_name,
+              last_name: person.last_name,
+              engagement_score: person.engagement_score,
+              session_attendance: []
+            };
+
+            existing.session_attendance.push({
+              session_id: sessionId,
+              session_attendance: person.session_attendance,
+              duration_spent_in_session: person.duration_spent_in_session,
+              chat_messages_sent: person.chat_messages_sent
+            });
+
+            byEmail.set(email, existing);
+          }
+        } catch (sessionErr) {
+          console.error(
+            `Session attendance failed for ${sessionId}:`,
+            sessionErr.response?.data || sessionErr.message
+          );
+        }
+      }
+
+      const mapped = [...byEmail.values()].map((person) =>
+        mapPersonSummary(person, webinarDate)
+      );
+
+      if (mapped.length > 0) {
+        console.log(`Mapped ${mapped.length} people from session attendance reports`);
+        return mapped;
+      }
+    }
+
+    console.log('WARNING: No person summary data found for event');
+    return [];
+  } catch (err) {
+    console.error('Error fetching attendance:', err.response?.data || err.message);
+    throw err;
+  }
+}
+
+// One GHL webhook for the whole event (batch). GHL Custom Code loops people[].
+async function sendAttendanceBatchToGHL({ eventId, webinarDate, people }) {
+  const payload = {
+    eventId,
+    webinarDate: webinarDate || '',
+    totalPeople: people.length,
+    attendedCount: people.filter((p) => p.attended).length,
+    absentCount: people.filter((p) => !p.attended).length,
+    people: people.map((person) => ({
+      email: person.email,
+      attended: person.attended ? 'yes' : 'no',
+      webinarDate: person.webinarDate || webinarDate || '',
+      timeSpentMinutes: String(person.timeSpentMinutes ?? 0),
+      engagementScore: person.engagementScore || ''
+    }))
+  };
+
+  try {
+    const response = await axios.post(ghlWebhookUrl, payload, {
+      headers: { 'Content-Type': 'application/json' }
+    });
+    return response.data;
+  } catch (err) {
+    console.error('Error sending batch to GHL:', err.response?.data || err.message);
+    throw err;
+  }
+}
+
 // ===== ROUTES =====
 
 // Health check
@@ -154,6 +375,78 @@ app.post('/webhooks/ghl-to-zoom', async (req, res) => {
   } catch (err) {
     return res.status(500).json({
       error: 'Zoom API error',
+      message: err.message,
+      zoomError: err.response?.data || null
+    });
+  }
+});
+
+// Zoom webhook endpoint - handles event end and sends attendance to GHL
+app.post('/webhooks/zoom-event-end', async (req, res) => {
+  try {
+    // Verify webhook secret if provided
+    const providedSecret = req.headers['x-webhook-secret'] || req.query.secret;
+    if (webhookSecret && providedSecret !== webhookSecret) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    // Extract event ID from Zoom webhook payload
+    const { event_id, event } = req.body;
+    const eventId = event_id || event?.id || req.body.eventId;
+
+    if (!eventId) {
+      return res.status(400).json({ error: 'Missing eventId in webhook payload' });
+    }
+
+    console.log(`Processing person summary report for event: ${eventId}`);
+
+    // Get People Tab style attendance from Zoom
+    const people = await getZoomEventAttendance(eventId);
+
+    if (!people || people.length === 0) {
+      return res.status(200).json({
+        status: 'success',
+        message: 'No people found in Zoom attendance report',
+        eventId,
+        processed: 0
+      });
+    }
+
+    const peopleWithEmail = people.filter((person) => person.email);
+    if (peopleWithEmail.length === 0) {
+      return res.status(200).json({
+        status: 'success',
+        message: 'No people with email found in Zoom attendance report',
+        eventId,
+        processed: 0
+      });
+    }
+
+    const webinarDate = peopleWithEmail[0]?.webinarDate || '';
+    console.log(
+      `Sending 1 GHL batch for event ${eventId}: ${peopleWithEmail.length} people`
+    );
+
+    await sendAttendanceBatchToGHL({
+      eventId,
+      webinarDate,
+      people: peopleWithEmail
+    });
+
+    return res.status(200).json({
+      status: 'success',
+      eventId,
+      mode: 'batch',
+      processed: peopleWithEmail.length,
+      attended: peopleWithEmail.filter((p) => p.attended).length,
+      absent: peopleWithEmail.filter((p) => !p.attended).length,
+      ghl: 'single webhook push'
+    });
+
+  } catch (err) {
+    console.error('Zoom webhook error:', err);
+    return res.status(500).json({
+      error: 'Webhook processing error',
       message: err.message,
       zoomError: err.response?.data || null
     });
