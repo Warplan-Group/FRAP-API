@@ -4,7 +4,7 @@
 # Usage: ./test-ghl-to-zoom.sh [email] [eventId] [firstName] [lastName] [webhookSecret]
 
 # Configuration
-API_URL="${API_URL:-https://frap-api-145186078912.us-south1.run.app/webhooks/ghl-to-zoom}"
+API_URL="${API_URL:-http://localhost:8080/webhooks/ghl-to-zoom}"
 WEBHOOK_SECRET="${WEBHOOK_SECRET:-${5:-${WEBHOOK_SECRET}}}"
 
 # Parameters (can be passed as arguments or use defaults)

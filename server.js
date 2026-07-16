@@ -64,8 +64,8 @@ async function getZoomTicketTypeId(accessToken, eventId) {
     throw new Error(`No ticket types found for event ${eventId}`);
   }
 
-  // Use the first ticket type (same as your Zap)
-  return types[0].id;
+  // Zoom returns ticket_type_id (not id)
+  return types[0].ticket_type_id || types[0].id;
 }
 
 // Create Ticket (Zapier Step 4)
@@ -83,7 +83,9 @@ async function createZoomTicket({ email, firstName, lastName, eventId }) {
           email,
           first_name: firstName,
           last_name: lastName,
-          ticket_type_id: ticketTypeId
+          ticket_type_id: ticketTypeId,
+          send_notification: true,
+          fast_join: false
         }
       ]
     },
